@@ -69,7 +69,10 @@ const TEMPLATE = `
   <label>Check URL <input id="probe-url" type="text" spellcheck="false"></label>
   <div class="grid">
     <label>Expected status <input id="probe-status" type="number" min="100" max="599"></label>
-    <label>Expected text <input id="probe-body" type="text" spellcheck="false"></label>
+    <label>Expected text
+      <input id="probe-body" type="text" spellcheck="false"
+        placeholder="(none — 204 endpoints return no body)">
+    </label>
   </div>
   <p class="hint">Leave "Expected text" empty for a 204-style endpoint that returns no body.</p>
 
@@ -130,6 +133,7 @@ const $ = (id) => document.getElementById(id);
 
 const STATE_CLASS = {
   online: 'ok',
+  confirming: 'idle',
   logging_in: 'busy',
   login_failed: 'warn',
   auth_rejected: 'bad',
@@ -142,6 +146,7 @@ const STATE_CLASS = {
 
 const STATE_LABEL = {
   online: 'Online',
+  confirming: 'Checking again…',
   logging_in: 'Signing in…',
   login_failed: 'Sign-in failed — retrying',
   auth_rejected: 'Credentials rejected',

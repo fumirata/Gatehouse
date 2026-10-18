@@ -49,6 +49,16 @@ const (
 	// says. No code path may post twice inside this window.
 	minPostInterval = 10 * time.Second
 
+	// How many consecutive failed connectivity checks are needed before a login
+	// is attempted.
+	//
+	// One is not enough. A single probe is one GET, and a dropped packet or one
+	// slow DNS lookup looks exactly like an outage — but acting on it sends the
+	// password over plain HTTP for nothing. Requiring a second, independent
+	// failure absorbs that, at the cost of one poll interval before a genuine
+	// outage is acted on.
+	probeFailuresBeforeLogin = 2
+
 	// Portals often apply authorisation asynchronously, so the first re-probe is
 	// immediate and these are the follow-ups.
 	verifyDelay1 = 2 * time.Second
@@ -68,12 +78,15 @@ const (
 	StateUnknown       State = "unknown"
 	StateNeedsConfig   State = "needs_config"
 	StateMisconfigured State = "misconfigured"
-	StateOnline        State = "online"
-	StateNotOnCampus   State = "not_on_campus"
-	StateLoggingIn     State = "logging_in"
-	StateLoginFailed   State = "login_failed"
-	StateAuthRejected  State = "auth_rejected"
-	StateSuspended     State = "suspended"
+	// StateConfirming means one connectivity check failed and another is needed
+	// before anything is sent.
+	StateConfirming   State = "confirming"
+	StateOnline       State = "online"
+	StateNotOnCampus  State = "not_on_campus"
+	StateLoggingIn    State = "logging_in"
+	StateLoginFailed  State = "login_failed"
+	StateAuthRejected State = "auth_rejected"
+	StateSuspended    State = "suspended"
 )
 
 // Attempt records one login try, for the UI's history list. This is the surface
@@ -168,6 +181,7 @@ type Monitor struct {
 	notified         bool
 	lastPostAt       time.Time
 	suspendedUntil   time.Time
+	probeFailures    int
 }
 
 // New builds a Monitor.
@@ -299,14 +313,31 @@ func (m *Monitor) step(ctx context.Context) {
 
 	switch res.Kind {
 	case probe.Online:
+		m.probeFailures = 0
 		m.markOnline("internet reachable")
 		return
 	case probe.Misconfigured:
 		// The probe settings are wrong, so we cannot tell whether anything needs
 		// doing. Say so rather than acting on an unknown.
+		m.probeFailures = 0
 		m.update(func(s *Snapshot) {
 			s.State = StateMisconfigured
 			s.Detail = res.Detail
+		})
+		return
+	}
+
+	// A failed check on its own is not enough to act on: one dropped packet or
+	// one slow DNS lookup looks exactly like an outage, and guessing wrong sends
+	// the password for nothing. Require a second, independent failure.
+	m.probeFailures++
+	if m.probeFailures < probeFailuresBeforeLogin {
+		m.log.Debug("connectivity check failed; confirming before doing anything",
+			"failures", m.probeFailures, "needed", probeFailuresBeforeLogin, "detail", res.Detail)
+		m.update(func(s *Snapshot) {
+			s.State = StateConfirming
+			s.Detail = fmt.Sprintf("the connection check failed (%d of %d) — checking again before signing in",
+				m.probeFailures, probeFailuresBeforeLogin)
 		})
 		return
 	}
@@ -431,6 +462,7 @@ func (m *Monitor) verifyOnline(ctx context.Context, cfg *config.Config) (bool, p
 // markOnline records success and clears every failure counter.
 func (m *Monitor) markOnline(detail string) {
 	wasOnline := m.state() == StateOnline
+	m.probeFailures = 0
 	m.resetBackoff()
 
 	m.update(func(s *Snapshot) {
