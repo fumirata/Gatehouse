@@ -196,6 +196,8 @@ func iconForState(s monitor.State) []byte {
 	case monitor.StateLoginFailed, monitor.StateAuthRejected, monitor.StateSuspended:
 		return icons.Error
 	default:
+		// Includes StateConfirming: one check has failed but nothing has been
+		// decided yet, so the calm grey icon is the honest one.
 		return icons.NoCampus
 	}
 }
@@ -220,6 +222,8 @@ func statusLabel(s monitor.Snapshot) string {
 		return "credentials rejected"
 	case monitor.StateSuspended:
 		return "paused after repeated failures"
+	case monitor.StateConfirming:
+		return "checking again…"
 	case monitor.StateNotOnCampus:
 		return "not on the campus network"
 	case monitor.StateNeedsConfig:

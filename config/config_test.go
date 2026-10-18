@@ -106,6 +106,58 @@ func TestValidateReportsEveryProblemAtOnce(t *testing.T) {
 	}
 }
 
+// An empty expected body is a legitimate choice, not a missing value: it is
+// exactly what a 204 endpoint returns. Defaulting it away would silently break
+// every preset that uses one.
+func TestEmptyExpectedBodySurvivesAReload(t *testing.T) {
+	path := tempConfig(t)
+
+	cfg, err := LoadFrom(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Username = "alice"
+	cfg.Password = "s3cret"
+	cfg.InternetProbe.URL = "http://connect.rom.miui.com/generate_204"
+	cfg.InternetProbe.ExpectStatus = 204
+	cfg.InternetProbe.ExpectBody = "" // deliberately empty
+
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	again, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if again.InternetProbe.ExpectBody != "" {
+		t.Errorf("expected body = %q after a reload, want it left empty", again.InternetProbe.ExpectBody)
+	}
+	if again.InternetProbe.URL != cfg.InternetProbe.URL {
+		t.Errorf("probe URL = %q, want %q", again.InternetProbe.URL, cfg.InternetProbe.URL)
+	}
+	if again.InternetProbe.ExpectStatus != 204 {
+		t.Errorf("expected status = %d, want 204", again.InternetProbe.ExpectStatus)
+	}
+}
+
+// A config that never mentions a probe still gets the whole default block.
+func TestAnAbsentProbeBlockGetsFullyDefaulted(t *testing.T) {
+	cfg, err := LoadFrom(tempConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.InternetProbe.URL != DefaultInternetProbeURL {
+		t.Errorf("probe URL = %q, want the default", cfg.InternetProbe.URL)
+	}
+	if cfg.InternetProbe.ExpectStatus != 200 {
+		t.Errorf("expected status = %d, want 200", cfg.InternetProbe.ExpectStatus)
+	}
+	if cfg.InternetProbe.ExpectBody != DefaultInternetExpectBody {
+		t.Errorf("expected body = %q, want the default", cfg.InternetProbe.ExpectBody)
+	}
+}
+
 func TestAccountNameAppendsTheCarrierSuffix(t *testing.T) {
 	tests := []struct {
 		name     string

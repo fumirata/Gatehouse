@@ -285,14 +285,23 @@ func (c *Config) Clone() *Config {
 // applyDefaults fills in every field that was absent or left blank, so both a
 // first run and a hand-edited file end up usable.
 func (c *Config) applyDefaults() {
+	// The probe block is defaulted as a unit, and only when it is entirely unset.
+	//
+	// ExpectBody is the reason: an empty expected body is a legitimate choice —
+	// it is exactly what a 204 endpoint returns — so treating empty as "absent"
+	// here would silently overwrite a deliberate setting on the next load. A
+	// user who picks the Xiaomi or Huawei preset needs the empty value to stick.
 	if strings.TrimSpace(c.InternetProbe.URL) == "" {
 		c.InternetProbe.URL = DefaultInternetProbeURL
+		if c.InternetProbe.ExpectStatus == 0 {
+			c.InternetProbe.ExpectStatus = http.StatusOK
+		}
+		if c.InternetProbe.ExpectBody == "" {
+			c.InternetProbe.ExpectBody = DefaultInternetExpectBody
+		}
 	}
 	if c.InternetProbe.ExpectStatus == 0 {
 		c.InternetProbe.ExpectStatus = http.StatusOK
-	}
-	if c.InternetProbe.ExpectBody == "" {
-		c.InternetProbe.ExpectBody = DefaultInternetExpectBody
 	}
 
 	if strings.TrimSpace(c.Carrier) == "" {

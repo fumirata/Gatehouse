@@ -157,12 +157,21 @@ func Internet(ctx context.Context, client HTTPDoer, cfg config.InternetProbe) Re
 		return Result{Kind: Intercepted, StatusCode: resp.StatusCode, Detail: detail}
 	}
 
-	return Result{
-		Kind:       Misconfigured,
-		StatusCode: resp.StatusCode,
-		Detail: fmt.Sprintf("probe returned HTTP %d, expected HTTP %d — check the probe settings",
-			resp.StatusCode, expectStatus),
+	// Name the half that actually mismatched. "Returned HTTP 204, expected HTTP
+	// 204" is what a status-only message degenerates into when it is really the
+	// expected text that is wrong, and it tells the user nothing.
+	detail := fmt.Sprintf("probe returned HTTP %d, expected HTTP %d — check the probe settings",
+		resp.StatusCode, expectStatus)
+	if resp.StatusCode == expectStatus {
+		detail = fmt.Sprintf("the probe answered HTTP %d as expected, but the body did not contain %q — check the expected text",
+			resp.StatusCode, cfg.ExpectBody)
+		if cfg.ExpectBody == "" {
+			detail = fmt.Sprintf("the probe answered HTTP %d but returned no body — check the expected text",
+				resp.StatusCode)
+		}
 	}
+
+	return Result{Kind: Misconfigured, StatusCode: resp.StatusCode, Detail: detail}
 }
 
 // PortalReachable reports whether the login host answers at the TCP level, and

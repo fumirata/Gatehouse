@@ -216,6 +216,16 @@ func (h *harness) stepAfter(d time.Duration) {
 	h.step()
 }
 
+// stepUntilAttempt runs the cycles needed to reach a credential-bearing attempt.
+// The first failed probe only starts confirmation, so a test expecting a login
+// has to pass that gate first.
+func (h *harness) stepUntilAttempt() {
+	h.t.Helper()
+	for i := 0; i < probeFailuresBeforeLogin; i++ {
+		h.step()
+	}
+}
+
 func (h *harness) state() State { return h.m.Snapshot().State }
 
 // ----------------------------------------------------------- the two promises
@@ -259,7 +269,7 @@ func TestSignsInWhenThePortalIsPresent(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, nil)
 	h.f.setIntercepted(true)
 
-	h.step()
+	h.stepUntilAttempt()
 
 	if got := h.state(); got != StateOnline {
 		t.Errorf("state = %q, want %q (detail: %s)", got, StateOnline, h.m.Snapshot().Detail)
@@ -296,7 +306,7 @@ func TestPasswordWithMetacharactersSurvivesTheRoundTrip(t *testing.T) {
 		c.Password = password
 	})
 	h.f.setIntercepted(true)
-	h.step()
+	h.stepUntilAttempt()
 
 	if n := h.f.loginCount(); n != 1 {
 		t.Fatalf("sent %d login requests, want 1", n)
@@ -311,6 +321,66 @@ func TestPasswordWithMetacharactersSurvivesTheRoundTrip(t *testing.T) {
 	}
 }
 
+// ------------------------------------------------------- confirming an outage
+
+// One failed check is a blip, not an outage. Acting on it would send the
+// password over plain HTTP for nothing.
+func TestOneFailedCheckDoesNotSendCredentials(t *testing.T) {
+	h := newHarness(t, dialAlwaysOK, nil)
+	h.f.setIntercepted(true)
+
+	h.step()
+
+	if got := h.state(); got != StateConfirming {
+		t.Errorf("state = %q, want %q", got, StateConfirming)
+	}
+	if n := h.f.loginCount(); n != 0 {
+		t.Errorf("sent %d login requests after a single failed check, want 0", n)
+	}
+}
+
+func TestTwoConsecutiveFailuresSendCredentials(t *testing.T) {
+	h := newHarness(t, dialAlwaysOK, nil)
+	h.f.setIntercepted(true)
+
+	h.step()
+	if n := h.f.loginCount(); n != 0 {
+		t.Fatalf("first check sent %d requests, want 0", n)
+	}
+
+	h.step()
+	if n := h.f.loginCount(); n != 1 {
+		t.Errorf("second consecutive failure sent %d requests, want 1", n)
+	}
+}
+
+// A healthy check between two failures means they were not consecutive, so the
+// count starts over rather than accumulating across an intermittent connection.
+func TestASuccessfulCheckResetsTheConfirmation(t *testing.T) {
+	h := newHarness(t, dialAlwaysOK, nil)
+
+	h.f.setIntercepted(true)
+	h.step() // failure 1
+	if got := h.state(); got != StateConfirming {
+		t.Fatalf("state = %q, want %q", got, StateConfirming)
+	}
+
+	h.f.setIntercepted(false)
+	h.step() // healthy — this must clear the count
+	if got := h.state(); got != StateOnline {
+		t.Fatalf("state = %q, want %q", got, StateOnline)
+	}
+
+	h.f.setIntercepted(true)
+	h.step() // failure 1 again, not failure 2
+	if n := h.f.loginCount(); n != 0 {
+		t.Errorf("sent %d login requests: the healthy check did not reset the count", n)
+	}
+	if got := h.state(); got != StateConfirming {
+		t.Errorf("state = %q, want %q", got, StateConfirming)
+	}
+}
+
 // ------------------------------------------------------------------- backoff
 
 func TestTransientFailuresBackOffExponentially(t *testing.T) {
@@ -318,8 +388,12 @@ func TestTransientFailuresBackOffExponentially(t *testing.T) {
 	h.f.setIntercepted(true)
 	h.f.stayOffline = true // the portal never actually opens up
 
-	var waits []time.Duration
-	for i := 0; i < 8; i++ {
+	// The first cycle only confirms; the second reaches the first attempt and
+	// schedules the base delay.
+	h.stepUntilAttempt()
+	waits := []time.Duration{h.m.nextWait()}
+
+	for i := 1; i < 8; i++ {
 		h.step()
 		waits = append(waits, h.m.nextWait())
 	}
@@ -341,9 +415,9 @@ func TestNoTwoRequestsInsideTheMinimumInterval(t *testing.T) {
 	h.f.setIntercepted(true)
 	h.f.stayOffline = true
 
-	h.step()
+	h.stepUntilAttempt()
 	if n := h.f.loginCount(); n != 1 {
-		t.Fatalf("first cycle sent %d requests, want 1", n)
+		t.Fatalf("first attempt cycle sent %d requests, want 1", n)
 	}
 
 	// The guard parks the cycle on a timer rather than returning, so the clock has
@@ -374,7 +448,7 @@ func TestRejectedCredentialsBackOffHardAndTellTheUser(t *testing.T) {
 	h.f.setIntercepted(true)
 	h.f.setReject(true)
 
-	h.step()
+	h.stepUntilAttempt()
 
 	if got := h.state(); got != StateAuthRejected {
 		t.Fatalf("state = %q, want %q (detail: %s)", got, StateAuthRejected, h.m.Snapshot().Detail)
@@ -394,7 +468,7 @@ func TestLoginThatDoesNotOpenTheNetworkIsTransient(t *testing.T) {
 	h.f.setIntercepted(true)
 	h.f.stayOffline = true
 
-	h.step()
+	h.stepUntilAttempt()
 
 	if got := h.state(); got != StateLoginFailed {
 		t.Errorf("state = %q, want %q", got, StateLoginFailed)
@@ -406,7 +480,9 @@ func TestRepeatedRejectionsPauseTheApp(t *testing.T) {
 	h.f.setIntercepted(true)
 	h.f.setReject(true)
 
-	for i := 0; i < maxDefinitiveStreak; i++ {
+	// The first cycle confirms the outage; the next one is the first rejection.
+	h.stepUntilAttempt()
+	for i := 1; i < maxDefinitiveStreak; i++ {
 		h.stepAfter(definitiveBackoff)
 	}
 
@@ -491,7 +567,7 @@ func TestCredentialsAreNotResentAcrossARedirect(t *testing.T) {
 		c.InternetProbe.URL = srv.URL + "/check"
 	})
 
-	h.step()
+	h.stepUntilAttempt()
 
 	if foreignHits != 0 {
 		t.Errorf("the credential-bearing request was followed to another host %d times, want 0", foreignHits)

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/sagan/gatehouse/config"
@@ -82,6 +83,43 @@ func TestInternetUnexpectedStatusIsMisconfigured(t *testing.T) {
 	got := Internet(context.Background(), NewClient(), checkConfig(srv.URL))
 	if got.Kind != Misconfigured {
 		t.Errorf("Kind = %v (%s), want Misconfigured", got.Kind, got.Detail)
+	}
+}
+
+// A 204 endpoint with an empty expected body is the normal configuration for the
+// Xiaomi and Huawei presets, and must read as online.
+func TestInternetAcceptsA204EndpointWithNoBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := config.InternetProbe{URL: srv.URL, ExpectStatus: 204, ExpectBody: ""}
+
+	got := Internet(context.Background(), NewClient(), cfg)
+	if got.Kind != Online {
+		t.Errorf("Kind = %v (%s), want Online", got.Kind, got.Detail)
+	}
+}
+
+// When the status matches but the body does not, say which half is wrong — a
+// message reading "returned HTTP 204, expected HTTP 204" is useless.
+func TestInternetNamesTheMismatchingHalf(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	// The state a wrongly-defaulted config leaves behind: a 204 endpoint still
+	// expected to return the NCSI payload.
+	cfg := config.InternetProbe{URL: srv.URL, ExpectStatus: 204, ExpectBody: config.DefaultInternetExpectBody}
+
+	got := Internet(context.Background(), NewClient(), cfg)
+	if got.Kind != Misconfigured {
+		t.Fatalf("Kind = %v, want Misconfigured", got.Kind)
+	}
+	if !strings.Contains(got.Detail, "expected text") {
+		t.Errorf("Detail = %q, want it to point at the expected text", got.Detail)
 	}
 }
 
