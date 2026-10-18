@@ -1,0 +1,16 @@
+# Wails build output
+build/bin/
+
+# Frontend dependencies and build output.
+frontend/node_modules/
+frontend/dist/*
+
+# //go:embed all:frontend/dist needs that directory to exist at compile time, so
+# keep the placeholder tracked. The negation must come after the rule above, or
+# git never reaches it. vite build empties dist/, so the npm postbuild script
+# recreates this file.
+!frontend/dist/.gitkeep
+
+# Local settings and logs
+config.json
+*.log
