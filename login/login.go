@@ -157,7 +157,7 @@ func Executef(ctx context.Context, client HTTPDoer, endpoint, referer, username,
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Referer", referer)
-	req.Header.Set("User-Agent", config.DefaultUserAgent)
+	req.Header.Set("User-Agent", config.BrowserUserAgent)
 
 	start := time.Now()
 	resp, err := client.Do(req)

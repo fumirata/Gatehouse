@@ -41,9 +41,17 @@ const (
 	// LoginPath is the Dr.COM login endpoint, relative to the portal address.
 	LoginPath = "/drcom/login"
 
-	// DefaultUserAgent is sent with probes. Some portals gate on the browser-like
-	// shape of this header, so it deliberately does not look like a bare Go client.
+	// DefaultUserAgent is sent with connectivity probes.
 	DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gatehouse/1.0"
+
+	// BrowserUserAgent is sent with the login request.
+	//
+	// This is the exact string a browser sent when the portal's login was
+	// captured, and it is reproduced verbatim on purpose: portals routinely
+	// branch on the User-Agent, and a request that does not look like the one the
+	// portal expects is a silent way to be refused.
+	BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 
 	// DefaultCarrier is the portal's default outlet (学生移动出口).
 	DefaultCarrier = "@cmcc"
