@@ -1,27 +1,10 @@
 export namespace config {
 	
-	export class InternetProbe {
-	    url: string;
-	    expect_status: number;
-	    expect_body: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new InternetProbe(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.url = source["url"];
-	        this.expect_status = source["expect_status"];
-	        this.expect_body = source["expect_body"];
-	    }
-	}
 	export class Config {
 	    username: string;
 	    password: string;
 	    carrier: string;
-	    internet_probe: InternetProbe;
-	    poll_interval_seconds: number;
+	    session_poll_interval_seconds: number;
 	    autostart: boolean;
 	
 	    static createFrom(source: any = {}) {
@@ -33,54 +16,15 @@ export namespace config {
 	        this.username = source["username"];
 	        this.password = source["password"];
 	        this.carrier = source["carrier"];
-	        this.internet_probe = this.convertValues(source["internet_probe"], InternetProbe);
-	        this.poll_interval_seconds = source["poll_interval_seconds"];
+	        this.session_poll_interval_seconds = source["session_poll_interval_seconds"];
 	        this.autostart = source["autostart"];
 	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
 	}
 
 }
 
 export namespace main {
 	
-	export class ProbePreset {
-	    name: string;
-	    url: string;
-	    status: number;
-	    body: string;
-	    note: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new ProbePreset(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.name = source["name"];
-	        this.url = source["url"];
-	        this.status = source["status"];
-	        this.body = source["body"];
-	        this.note = source["note"];
-	    }
-	}
 	export class SaveResult {
 	    ok: boolean;
 	    errors: string[];
@@ -146,8 +90,8 @@ export namespace monitor {
 	export class Snapshot {
 	    state: string;
 	    detail: string;
-	    probe_kind: string;
-	    probe_detail: string;
+	    session_kind: string;
+	    session_note: string;
 	    // Go type: time
 	    last_check_at: any;
 	    // Go type: time
@@ -158,7 +102,8 @@ export namespace monitor {
 	    config_error: string;
 	    last_attempt?: Attempt;
 	    history: Attempt[];
-	    portal_address: string;
+	    session_uid: string;
+	    session_seconds: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new Snapshot(source);
@@ -168,8 +113,8 @@ export namespace monitor {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.state = source["state"];
 	        this.detail = source["detail"];
-	        this.probe_kind = source["probe_kind"];
-	        this.probe_detail = source["probe_detail"];
+	        this.session_kind = source["session_kind"];
+	        this.session_note = source["session_note"];
 	        this.last_check_at = this.convertValues(source["last_check_at"], null);
 	        this.next_retry_at = this.convertValues(source["next_retry_at"], null);
 	        this.online_since = this.convertValues(source["online_since"], null);
@@ -177,7 +122,8 @@ export namespace monitor {
 	        this.config_error = source["config_error"];
 	        this.last_attempt = this.convertValues(source["last_attempt"], Attempt);
 	        this.history = this.convertValues(source["history"], Attempt);
-	        this.portal_address = source["portal_address"];
+	        this.session_uid = source["session_uid"];
+	        this.session_seconds = source["session_seconds"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

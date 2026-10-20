@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func tempConfig(t *testing.T) string {
@@ -19,14 +20,8 @@ func TestMissingFileYieldsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFrom on a missing file: %v", err)
 	}
-	if cfg.InternetProbe.URL != DefaultInternetProbeURL {
-		t.Errorf("probe URL = %q, want the default", cfg.InternetProbe.URL)
-	}
-	if cfg.InternetProbe.ExpectStatus != 200 {
-		t.Errorf("expected status = %d, want 200", cfg.InternetProbe.ExpectStatus)
-	}
-	if cfg.PollInterval() != DefaultPollInterval {
-		t.Errorf("poll interval = %v, want %v", cfg.PollInterval(), DefaultPollInterval)
+	if cfg.SessionPollInterval() != DefaultSessionPollInterval {
+		t.Errorf("poll interval = %v, want %v", cfg.SessionPollInterval(), DefaultSessionPollInterval)
 	}
 
 	// And it must be recognisably unconfigured, because there are no credentials.
@@ -44,7 +39,7 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 	}
 	loaded.Username = "2026000000@cmcc"
 	loaded.Password = "s3cret"
-	loaded.PollIntervalSeconds = 42
+	loaded.SessionPollIntervalSeconds = 42
 	loaded.Autostart = true
 
 	if err := loaded.Save(); err != nil {
@@ -58,8 +53,8 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 	if again.Username != "2026000000@cmcc" || again.Password != "s3cret" {
 		t.Errorf("credentials did not survive: %q / %q", again.Username, again.Password)
 	}
-	if again.PollIntervalSeconds != 42 {
-		t.Errorf("poll interval = %d, want 42", again.PollIntervalSeconds)
+	if again.SessionPollIntervalSeconds != 42 {
+		t.Errorf("poll interval = %d, want 42", again.SessionPollIntervalSeconds)
 	}
 	if !again.Autostart {
 		t.Error("autostart did not survive")
@@ -103,58 +98,6 @@ func TestValidateReportsEveryProblemAtOnce(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("validation message %q does not mention %q", msg, want)
 		}
-	}
-}
-
-// An empty expected body is a legitimate choice, not a missing value: it is
-// exactly what a 204 endpoint returns. Defaulting it away would silently break
-// every preset that uses one.
-func TestEmptyExpectedBodySurvivesAReload(t *testing.T) {
-	path := tempConfig(t)
-
-	cfg, err := LoadFrom(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.Username = "alice"
-	cfg.Password = "s3cret"
-	cfg.InternetProbe.URL = "http://connect.rom.miui.com/generate_204"
-	cfg.InternetProbe.ExpectStatus = 204
-	cfg.InternetProbe.ExpectBody = "" // deliberately empty
-
-	if err := cfg.Save(); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-
-	again, err := LoadFrom(path)
-	if err != nil {
-		t.Fatalf("LoadFrom: %v", err)
-	}
-	if again.InternetProbe.ExpectBody != "" {
-		t.Errorf("expected body = %q after a reload, want it left empty", again.InternetProbe.ExpectBody)
-	}
-	if again.InternetProbe.URL != cfg.InternetProbe.URL {
-		t.Errorf("probe URL = %q, want %q", again.InternetProbe.URL, cfg.InternetProbe.URL)
-	}
-	if again.InternetProbe.ExpectStatus != 204 {
-		t.Errorf("expected status = %d, want 204", again.InternetProbe.ExpectStatus)
-	}
-}
-
-// A config that never mentions a probe still gets the whole default block.
-func TestAnAbsentProbeBlockGetsFullyDefaulted(t *testing.T) {
-	cfg, err := LoadFrom(tempConfig(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.InternetProbe.URL != DefaultInternetProbeURL {
-		t.Errorf("probe URL = %q, want the default", cfg.InternetProbe.URL)
-	}
-	if cfg.InternetProbe.ExpectStatus != 200 {
-		t.Errorf("expected status = %d, want 200", cfg.InternetProbe.ExpectStatus)
-	}
-	if cfg.InternetProbe.ExpectBody != DefaultInternetExpectBody {
-		t.Errorf("expected body = %q, want the default", cfg.InternetProbe.ExpectBody)
 	}
 }
 
@@ -263,14 +206,14 @@ func TestRedactedHidesThePassword(t *testing.T) {
 }
 
 func TestResetClearsCredentialsButKeepsTuning(t *testing.T) {
-	cfg := &Config{Username: "a", Password: "b", PollIntervalSeconds: 30}
+	cfg := &Config{Username: "a", Password: "b", SessionPollIntervalSeconds: 30}
 	cfg.Reset()
 
 	if cfg.Username != "" || cfg.Password != "" {
 		t.Error("Reset left the credentials in place")
 	}
-	if cfg.PollIntervalSeconds != 30 {
-		t.Errorf("poll interval = %d, want the tuning to be preserved", cfg.PollIntervalSeconds)
+	if cfg.SessionPollIntervalSeconds != 30 {
+		t.Errorf("poll interval = %d, want the tuning to be preserved", cfg.SessionPollIntervalSeconds)
 	}
 }
 
@@ -303,5 +246,47 @@ func TestSaveLeavesNoTemporaryFiles(t *testing.T) {
 		if e.Name() != filepath.Base(path) {
 			t.Errorf("unexpected leftover file %q after an atomic save", e.Name())
 		}
+	}
+}
+
+// The poll interval is the knob that controls how quickly the app notices an
+// expired session, so its bounds matter.
+func TestSessionPollIntervalClamps(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want time.Duration
+	}{
+		{"default", 0, DefaultSessionPollInterval},
+		{"negative falls back to the default", -5, DefaultSessionPollInterval},
+		{"minimum", 1, time.Second},
+		{"below the minimum clamps up", 0 + 0, DefaultSessionPollInterval},
+		{"in range", 12, 12 * time.Second},
+		{"maximum", 60, 60 * time.Second},
+		{"above the maximum clamps down", 100, 60 * time.Second},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{SessionPollIntervalSeconds: tc.in}
+			if got := cfg.SessionPollInterval(); got != tc.want {
+				t.Errorf("SessionPollInterval() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A negative value must not clamp to the 1s minimum — it means "unset".
+func TestNegativePollIntervalIsTreatedAsUnset(t *testing.T) {
+	cfg := &Config{SessionPollIntervalSeconds: -1}
+	if got := cfg.SessionPollInterval(); got != DefaultSessionPollInterval {
+		t.Errorf("SessionPollInterval() = %v, want the default", got)
+	}
+}
+
+func TestSessionURLCarriesTheCallback(t *testing.T) {
+	// The portal answers HTTP 400 without it, so this is load-bearing.
+	if got := SessionURL(); !strings.Contains(got, "callback=dr1002") {
+		t.Errorf("SessionURL() = %q, want the dr1002 callback", got)
 	}
 }

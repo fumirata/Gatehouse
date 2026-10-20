@@ -2,195 +2,149 @@ package probe
 
 import (
 	"context"
-	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/sagan/gatehouse/config"
 )
 
-func checkConfig(url string) config.InternetProbe {
-	return config.InternetProbe{
-		URL:          url,
-		ExpectStatus: http.StatusOK,
-		ExpectBody:   config.DefaultInternetExpectBody,
-	}
-}
+// The shapes the portal actually sends. These come from a live session and from
+// the portal's own login script, which branches on result.
+const (
+	replyOnline  = `dr1002({"result":1,"time":2231,"uid":"2026000000@cmcc","v4ip":"10.1.109.190","oltime":864000,"flow":33396033})`
+	replyOffline = `dr1002({"result":0})`
+)
 
-func TestInternetReached(t *testing.T) {
+func serve(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(config.DefaultInternetExpectBody))
+		w.WriteHeader(status)
+		io.WriteString(w, body)
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv
+}
 
-	got := Internet(context.Background(), NewClient(), checkConfig(srv.URL))
-	if got.Kind != Online {
-		t.Errorf("Kind = %v (%s), want Online", got.Kind, got.Detail)
+func TestSessionOnline(t *testing.T) {
+	srv := serve(t, http.StatusOK, replyOnline)
+
+	got := SessionStatusAt(context.Background(), NewClient(), srv.URL)
+	if got.Kind != SessionOnline {
+		t.Fatalf("Kind = %v (%s), want Online", got.Kind, got.Detail)
+	}
+	if got.UID != "2026000000@cmcc" {
+		t.Errorf("UID = %q, want the account the portal reports", got.UID)
+	}
+	if got.OnlineSeconds != 864000 {
+		t.Errorf("OnlineSeconds = %d, want 864000", got.OnlineSeconds)
 	}
 }
 
-func TestInternetInterceptedByRedirect(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "http://10.0.0.1/portal", http.StatusFound)
-	}))
-	defer srv.Close()
+func TestSessionOffline(t *testing.T) {
+	srv := serve(t, http.StatusOK, replyOffline)
 
-	got := Internet(context.Background(), NewClient(), checkConfig(srv.URL))
-	if got.Kind != Intercepted {
-		t.Fatalf("Kind = %v (%s), want Intercepted", got.Kind, got.Detail)
-	}
-	if got.RedirectHost != "10.0.0.1" {
-		t.Errorf("RedirectHost = %q, want %q", got.RedirectHost, "10.0.0.1")
+	got := SessionStatusAt(context.Background(), NewClient(), srv.URL)
+	if got.Kind != SessionOffline {
+		t.Fatalf("Kind = %v (%s), want Offline", got.Kind, got.Detail)
 	}
 }
 
-func TestInternetInterceptedByLoginPage(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(`<html><body><form><input type="password" name="p"></form></body></html>`))
-	}))
-	defer srv.Close()
+// The safety-critical cases. Anything that is not a clean, parsed result must
+// never be reported as Offline: doing so would let a broken portal trigger a
+// login on every poll cycle.
+func TestUnreadableRepliesAreNeverOffline(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"HTTP 400 as the portal sends without a callback", http.StatusBadRequest,
+			"<html><body>Error code: 400 URL no found</body></html>"},
+		{"HTML login page from an interception", http.StatusOK,
+			`<html><form><input type="password"></form></html>`},
+		{"empty body", http.StatusOK, ""},
+		{"payload without a result field", http.StatusOK, `dr1002({"uid":"x"})`},
+		{"unexpected status code", http.StatusOK, `dr1002({"result":7})`},
+		{"not JSONP at all", http.StatusOK, `success`},
+	}
 
-	got := Internet(context.Background(), NewClient(), checkConfig(srv.URL))
-	if got.Kind != Intercepted {
-		t.Errorf("Kind = %v (%s), want Intercepted", got.Kind, got.Detail)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := serve(t, tc.status, tc.body)
+
+			got := SessionStatusAt(context.Background(), NewClient(), srv.URL)
+			if got.Kind == SessionOffline {
+				t.Fatalf("an unreadable reply was reported as Offline: %+v", got)
+			}
+			if got.Kind != SessionUnreadable {
+				t.Errorf("Kind = %v, want Unreadable", got.Kind)
+			}
+		})
 	}
 }
 
-func TestInternetUnreachable(t *testing.T) {
-	// A port that is closed, so the dial fails the way a dead network does.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+func TestSessionUnreachable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	url := srv.URL
 	srv.Close()
 
-	got := Internet(context.Background(), NewClient(), checkConfig(url))
-	if got.Kind != NoNetwork {
-		t.Errorf("Kind = %v (%s), want NoNetwork", got.Kind, got.Detail)
+	got := SessionStatusAt(context.Background(), NewClient(), url)
+	if got.Kind != SessionUnreachable {
+		t.Errorf("Kind = %v (%s), want Unreachable", got.Kind, got.Detail)
 	}
 }
 
-// A 404 with no body means the probe settings are wrong, not that the network is
-// down — reporting a phantom outage here would be actively misleading.
-func TestInternetUnexpectedStatusIsMisconfigured(t *testing.T) {
+// A captive portal announcing itself with a redirect must not be read as a
+// status answer.
+func TestSessionDoesNotFollowRedirects(t *testing.T) {
+	var foreignHits int
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreignHits++
+		io.WriteString(w, replyOnline)
+	}))
+	defer foreign.Close()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
+		http.Redirect(w, r, foreign.URL, http.StatusFound)
 	}))
 	defer srv.Close()
 
-	got := Internet(context.Background(), NewClient(), checkConfig(srv.URL))
-	if got.Kind != Misconfigured {
-		t.Errorf("Kind = %v (%s), want Misconfigured", got.Kind, got.Detail)
+	got := SessionStatusAt(context.Background(), NewClient(), srv.URL)
+	if foreignHits != 0 {
+		t.Errorf("the status check was followed to another host %d time(s), want 0", foreignHits)
+	}
+	if got.Kind == SessionOnline {
+		t.Error("a redirect was read as an online session")
 	}
 }
 
-// A 204 endpoint with an empty expected body is the normal configuration for the
-// Xiaomi and Huawei presets, and must read as online.
-func TestInternetAcceptsA204EndpointWithNoBody(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
+func TestParseSessionToleratesWhitespaceAndKeyOrder(t *testing.T) {
+	body := []byte(`dr1002({ "oltime" : 42 , "uid" : "a@b" , "result" : 1 })`)
 
-	cfg := config.InternetProbe{URL: srv.URL, ExpectStatus: 204, ExpectBody: ""}
-
-	got := Internet(context.Background(), NewClient(), cfg)
-	if got.Kind != Online {
-		t.Errorf("Kind = %v (%s), want Online", got.Kind, got.Detail)
+	got := parseSession(body)
+	if got.Kind != SessionOnline {
+		t.Fatalf("Kind = %v, want Online", got.Kind)
+	}
+	if got.UID != "a@b" || got.OnlineSeconds != 42 {
+		t.Errorf("parsed %q / %d, want a@b / 42", got.UID, got.OnlineSeconds)
 	}
 }
 
-// When the status matches but the body does not, say which half is wrong — a
-// message reading "returned HTTP 204, expected HTTP 204" is useless.
-func TestInternetNamesTheMismatchingHalf(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
-
-	// The state a wrongly-defaulted config leaves behind: a 204 endpoint still
-	// expected to return the NCSI payload.
-	cfg := config.InternetProbe{URL: srv.URL, ExpectStatus: 204, ExpectBody: config.DefaultInternetExpectBody}
-
-	got := Internet(context.Background(), NewClient(), cfg)
-	if got.Kind != Misconfigured {
-		t.Fatalf("Kind = %v, want Misconfigured", got.Kind)
+func TestParseSessionOfflineWithoutExtraFields(t *testing.T) {
+	got := parseSession([]byte(`dr1002({"result":0})`))
+	if got.Kind != SessionOffline {
+		t.Fatalf("Kind = %v, want Offline", got.Kind)
 	}
-	if !strings.Contains(got.Detail, "expected text") {
-		t.Errorf("Detail = %q, want it to point at the expected text", got.Detail)
+	if got.UID != "" {
+		t.Errorf("UID = %q, want empty for an offline session", got.UID)
 	}
 }
 
-func TestInternetRejectsAnInvalidURL(t *testing.T) {
-	got := Internet(context.Background(), NewClient(), checkConfig("://nonsense"))
-	if got.Kind != Misconfigured {
-		t.Errorf("Kind = %v, want Misconfigured", got.Kind)
-	}
-}
-
-func TestPortalReachable(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer srv.Close()
-
-	dial := (&net.Dialer{}).DialContext
-
-	ok, addr, err := PortalReachable(context.Background(), dial, srv.URL+"/login")
-	if !ok {
-		t.Fatalf("PortalReachable = false (%v) for %s", err, addr)
-	}
-
-	// The same dialer against a closed port must report unreachable.
-	closed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	deadURL := closed.URL
-	closed.Close()
-
-	ok, _, _ = PortalReachable(context.Background(), dial, deadURL+"/login")
-	if ok {
-		t.Error("PortalReachable = true for a closed port")
-	}
-}
-
-func TestPortalReachablePropagatesDialFailure(t *testing.T) {
-	sentinel := errors.New("network is unreachable")
-	dial := func(context.Context, string, string) (net.Conn, error) { return nil, sentinel }
-
-	ok, addr, err := PortalReachable(context.Background(), dial, "https://portal.example.edu/login")
-	if ok {
-		t.Fatal("PortalReachable = true despite the dial failing")
-	}
-	if !errors.Is(err, sentinel) {
-		t.Errorf("err = %v, want the dial error", err)
-	}
-	if addr != "portal.example.edu:443" {
-		t.Errorf("addr = %q, want the https default port to be applied", addr)
-	}
-}
-
-func TestHostPortDefaultsByScheme(t *testing.T) {
-	tests := []struct {
-		in, want string
-	}{
-		{"http://10.0.0.1/login", "10.0.0.1:80"},
-		{"https://auth.example.edu/eportal/x", "auth.example.edu:443"},
-		{"http://10.0.0.1:8080/login", "10.0.0.1:8080"},
-		{"https://auth.example.edu:9443/", "auth.example.edu:9443"},
-	}
-	for _, tc := range tests {
-		got, err := hostPort(tc.in)
-		if err != nil {
-			t.Errorf("hostPort(%q): %v", tc.in, err)
-			continue
-		}
-		if got != tc.want {
-			t.Errorf("hostPort(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
-
-func TestHostPortRejectsAHostlessURL(t *testing.T) {
-	if _, err := hostPort("http:///login"); err == nil {
-		t.Error("hostPort accepted a URL with no host")
+func TestDescribeNetErrNamesATimeout(t *testing.T) {
+	err := &net.DNSError{Name: "10.255.0.19", Err: "no such host"}
+	if got := describeNetErr(err); !strings.Contains(got, "DNS lookup") {
+		t.Errorf("describeNetErr = %q, want it to name the DNS failure", got)
 	}
 }

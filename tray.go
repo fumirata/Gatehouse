@@ -195,9 +195,11 @@ func iconForState(s monitor.State) []byte {
 		return icons.Connecting
 	case monitor.StateLoginFailed, monitor.StateAuthRejected, monitor.StateSuspended:
 		return icons.Error
+	case monitor.StateUnreadable:
+		// Amber: the app is not sure what is happening, but it has not failed to
+		// sign in and it is deliberately not acting.
+		return icons.Connecting
 	default:
-		// Includes StateConfirming: one check has failed but nothing has been
-		// decided yet, so the calm grey icon is the honest one.
 		return icons.NoCampus
 	}
 }
@@ -222,14 +224,12 @@ func statusLabel(s monitor.Snapshot) string {
 		return "credentials rejected"
 	case monitor.StateSuspended:
 		return "paused after repeated failures"
-	case monitor.StateConfirming:
-		return "checking again…"
 	case monitor.StateNotOnCampus:
 		return "not on the campus network"
 	case monitor.StateNeedsConfig:
 		return "not configured yet"
-	case monitor.StateMisconfigured:
-		return "check the connectivity probe settings"
+	case monitor.StateUnreadable:
+		return "could not read the portal's status"
 	default:
 		return "starting up"
 	}

@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,16 +22,20 @@ const (
 	// FileName is the settings file name.
 	FileName = "config.json"
 
-	// DefaultInternetProbeURL is Microsoft's NCSI endpoint. It is used instead of
-	// connectivitycheck.gstatic.com on purpose: gstatic is unreachable from
-	// mainland China, which would make every single check look like an outage.
-	DefaultInternetProbeURL = "http://www.msftconnecttest.com/connecttest.txt"
-	// DefaultInternetExpectBody is the exact payload NCSI returns when the
-	// internet is genuinely reachable.
-	DefaultInternetExpectBody = "Microsoft Connect Test"
+	// DefaultSessionPollInterval is how often the portal is asked whether this
+	// machine is signed in.
+	//
+	// The check is a LAN round trip that answers in single-digit milliseconds at
+	// best and ~100ms typically, so polling this often costs almost nothing and
+	// is what lets the app react to an expired session in seconds rather than
+	// tens of seconds.
+	DefaultSessionPollInterval = 5 * time.Second
 
-	// DefaultPollInterval is how often the network is re-checked.
-	DefaultPollInterval = 15 * time.Second
+	// SessionPollIntervalMin and SessionPollIntervalMax bound the setting. Below
+	// the minimum the app would issue requests faster than it can act on them;
+	// above the maximum it is slower than the design it replaced.
+	SessionPollIntervalMin = 1
+	SessionPollIntervalMax = 60
 
 	// PortalURL is this campus's Dr.COM portal. It is a constant rather than a
 	// setting: Gatehouse exists for one network.
@@ -41,7 +44,12 @@ const (
 	// LoginPath is the Dr.COM login endpoint, relative to the portal address.
 	LoginPath = "/drcom/login"
 
-	// DefaultUserAgent is sent with connectivity probes.
+	// SessionPath reports whether this client currently has an authenticated
+	// session. The callback parameter is not optional: the portal answers HTTP
+	// 400 without it.
+	SessionPath = "drcom/chkstatus?callback=dr1002"
+
+	// DefaultUserAgent is sent with the portal status check.
 	DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gatehouse/1.0"
 
 	// BrowserUserAgent is sent with the login request.
@@ -86,21 +94,16 @@ type Config struct {
 	// The portal does this itself when you pick an outlet on its login page.
 	Carrier string `json:"carrier"`
 
-	InternetProbe InternetProbe `json:"internet_probe"`
+	// SessionPollIntervalSeconds is how often the portal is asked whether this
+	// machine is signed in. Clamped to [SessionPollIntervalMin,
+	// SessionPollIntervalMax] on load.
+	SessionPollIntervalSeconds int `json:"session_poll_interval_seconds"`
 
-	PollIntervalSeconds int  `json:"poll_interval_seconds"`
-	Autostart           bool `json:"autostart"`
+	Autostart bool `json:"autostart"`
 
 	// path remembers where this config was loaded from so Save does not have to
 	// re-derive it (and so tests can save to a temp file).
 	path string `json:"-"`
-}
-
-// InternetProbe describes how "do I have internet?" is decided.
-type InternetProbe struct {
-	URL          string `json:"url"`
-	ExpectStatus int    `json:"expect_status"`
-	ExpectBody   string `json:"expect_body"`
 }
 
 // Path returns the location of the config file.
@@ -228,13 +231,26 @@ func (c *Config) Warnings() []string {
 	}
 }
 
-// PollInterval returns the configured poll interval as a duration.
-func (c *Config) PollInterval() time.Duration {
-	if c.PollIntervalSeconds <= 0 {
-		return DefaultPollInterval
+// SessionPollInterval returns how long to wait between portal status checks.
+//
+// The value is clamped rather than rejected: a hand-edited file or an odd form
+// submission should not stop the app working, and a value outside the bounds is
+// far more likely to be a mistake than an intention.
+func (c *Config) SessionPollInterval() time.Duration {
+	n := c.SessionPollIntervalSeconds
+	switch {
+	case n <= 0:
+		return DefaultSessionPollInterval
+	case n < SessionPollIntervalMin:
+		n = SessionPollIntervalMin
+	case n > SessionPollIntervalMax:
+		n = SessionPollIntervalMax
 	}
-	return time.Duration(c.PollIntervalSeconds) * time.Second
+	return time.Duration(n) * time.Second
 }
+
+// SessionURL is the portal endpoint that reports this client's session state.
+func SessionURL() string { return PortalURL + SessionPath }
 
 // AccountName is the username as the portal expects it: the bare account number
 // with the selected carrier suffix.
@@ -285,30 +301,11 @@ func (c *Config) Clone() *Config {
 // applyDefaults fills in every field that was absent or left blank, so both a
 // first run and a hand-edited file end up usable.
 func (c *Config) applyDefaults() {
-	// The probe block is defaulted as a unit, and only when it is entirely unset.
-	//
-	// ExpectBody is the reason: an empty expected body is a legitimate choice —
-	// it is exactly what a 204 endpoint returns — so treating empty as "absent"
-	// here would silently overwrite a deliberate setting on the next load. A
-	// user who picks the Xiaomi or Huawei preset needs the empty value to stick.
-	if strings.TrimSpace(c.InternetProbe.URL) == "" {
-		c.InternetProbe.URL = DefaultInternetProbeURL
-		if c.InternetProbe.ExpectStatus == 0 {
-			c.InternetProbe.ExpectStatus = http.StatusOK
-		}
-		if c.InternetProbe.ExpectBody == "" {
-			c.InternetProbe.ExpectBody = DefaultInternetExpectBody
-		}
-	}
-	if c.InternetProbe.ExpectStatus == 0 {
-		c.InternetProbe.ExpectStatus = http.StatusOK
-	}
-
 	if strings.TrimSpace(c.Carrier) == "" {
 		c.Carrier = DefaultCarrier
 	}
 
-	if c.PollIntervalSeconds <= 0 {
-		c.PollIntervalSeconds = int(DefaultPollInterval / time.Second)
+	if c.SessionPollIntervalSeconds <= 0 {
+		c.SessionPollIntervalSeconds = int(DefaultSessionPollInterval / time.Second)
 	}
 }

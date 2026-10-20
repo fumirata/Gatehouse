@@ -183,6 +183,18 @@ button.danger:hover:not(:disabled) { border-color: var(--bad); }
 
 .account-preview { color: var(--text); font-weight: 600; }
 
+.session-line {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  font-size: 12.5px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.session-line.online { border-color: #a7d8b6; background: #eefaf1; color: #14532d; }
+.session-line.unreadable { border-color: #f0cf9a; background: #fff8ec; color: #7c2d12; }
+
 /* ----------------------------------------------------------------- banner */
 
 .banner {

@@ -12,7 +12,6 @@ package monitor
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -49,20 +48,10 @@ const (
 	// says. No code path may post twice inside this window.
 	minPostInterval = 10 * time.Second
 
-	// How many consecutive failed connectivity checks are needed before a login
-	// is attempted.
-	//
-	// One is not enough. A single probe is one GET, and a dropped packet or one
-	// slow DNS lookup looks exactly like an outage — but acting on it sends the
-	// password over plain HTTP for nothing. Requiring a second, independent
-	// failure absorbs that, at the cost of one poll interval before a genuine
-	// outage is acted on.
-	probeFailuresBeforeLogin = 2
-
-	// Portals often apply authorisation asynchronously, so the first re-probe is
+	// Portals often apply authorisation asynchronously, so the first re-check is
 	// immediate and these are the follow-ups.
-	verifyDelay1 = 2 * time.Second
-	verifyDelay2 = 3 * time.Second
+	verifyDelay1 = 1 * time.Second
+	verifyDelay2 = 2 * time.Second
 
 	historyLimit = 20
 )
@@ -75,12 +64,13 @@ type HTTPDoer = probe.HTTPDoer
 type State string
 
 const (
-	StateUnknown       State = "unknown"
-	StateNeedsConfig   State = "needs_config"
-	StateMisconfigured State = "misconfigured"
-	// StateConfirming means one connectivity check failed and another is needed
-	// before anything is sent.
-	StateConfirming   State = "confirming"
+	StateUnknown State = "unknown"
+	// StateNeedsConfig means there are no credentials to sign in with.
+	StateNeedsConfig State = "needs_config"
+	// StateUnreadable means the portal answered but not in a way we understand.
+	// Nothing is sent: a portal error page or an interception must never be read
+	// as "you are offline, sign in".
+	StateUnreadable   State = "unreadable"
 	StateOnline       State = "online"
 	StateNotOnCampus  State = "not_on_campus"
 	StateLoggingIn    State = "logging_in"
@@ -101,18 +91,21 @@ type Attempt struct {
 
 // Snapshot is an immutable view of the monitor, safe to hand to the UI.
 type Snapshot struct {
-	State         State     `json:"state"`
-	Detail        string    `json:"detail"`
-	ProbeKind     string    `json:"probe_kind"`
-	ProbeDetail   string    `json:"probe_detail"`
-	LastCheckAt   time.Time `json:"last_check_at"`
-	NextRetryAt   time.Time `json:"next_retry_at"`
-	OnlineSince   time.Time `json:"online_since"`
-	Consecutive   int       `json:"consecutive_failures"`
-	ConfigError   string    `json:"config_error"`
-	LastAttempt   *Attempt  `json:"last_attempt,omitempty"`
-	History       []Attempt `json:"history"`
-	PortalAddress string    `json:"portal_address"`
+	State       State     `json:"state"`
+	Detail      string    `json:"detail"`
+	SessionKind string    `json:"session_kind"`
+	SessionNote string    `json:"session_note"`
+	LastCheckAt time.Time `json:"last_check_at"`
+	NextRetryAt time.Time `json:"next_retry_at"`
+	OnlineSince time.Time `json:"online_since"`
+	Consecutive int       `json:"consecutive_failures"`
+	ConfigError string    `json:"config_error"`
+	LastAttempt *Attempt  `json:"last_attempt,omitempty"`
+	History     []Attempt `json:"history"`
+	// SessionUID and SessionSeconds are what the portal reports about the
+	// current session, for the settings window.
+	SessionUID     string `json:"session_uid"`
+	SessionSeconds int64  `json:"session_seconds"`
 }
 
 // Options are the monitor's dependencies. Everything that touches the outside
@@ -142,15 +135,15 @@ type Options struct {
 	Endpoint *Endpoint
 }
 
-// Endpoint is where the reachability gate and the login request are aimed.
+// Endpoint is where the status check and the login request are aimed.
 type Endpoint struct {
-	Root  string // e.g. http://10.255.0.19/
-	Login string // e.g. http://10.255.0.19/drcom/login
+	Session string // e.g. http://10.255.0.19/drcom/chkstatus?callback=dr1002
+	Login   string // e.g. http://10.255.0.19/drcom/login
 }
 
 // campusEndpoint is the fixed portal this application exists for.
 func campusEndpoint() Endpoint {
-	return Endpoint{Root: config.PortalRoot(), Login: config.LoginURL()}
+	return Endpoint{Session: config.SessionURL(), Login: config.LoginURL()}
 }
 
 // command is a nudge from another goroutine. Routing it through a channel keeps
@@ -308,65 +301,53 @@ func (m *Monitor) step(ctx context.Context) {
 	}
 	m.update(func(s *Snapshot) { s.ConfigError = "" })
 
-	res := probe.Internet(ctx, m.opts.Client, cfg.InternetProbe)
-	m.recordProbe(res)
+	// Ask the portal directly. There is no internet probe: the portal's own
+	// verdict is both faster and unambiguous, which is what lets a login happen
+	// on the first cycle after a session expires.
+	sess := m.session(ctx)
+	m.recordSession(sess)
 
-	switch res.Kind {
-	case probe.Online:
-		m.probeFailures = 0
-		m.markOnline("internet reachable")
-		return
-	case probe.Misconfigured:
-		// The probe settings are wrong, so we cannot tell whether anything needs
-		// doing. Say so rather than acting on an unknown.
-		m.probeFailures = 0
-		m.update(func(s *Snapshot) {
-			s.State = StateMisconfigured
-			s.Detail = res.Detail
-		})
-		return
-	}
+	switch sess.Kind {
+	case probe.SessionOnline:
+		m.markOnline(sess)
 
-	// A failed check on its own is not enough to act on: one dropped packet or
-	// one slow DNS lookup looks exactly like an outage, and guessing wrong sends
-	// the password for nothing. Require a second, independent failure.
-	m.probeFailures++
-	if m.probeFailures < probeFailuresBeforeLogin {
-		m.log.Debug("connectivity check failed; confirming before doing anything",
-			"failures", m.probeFailures, "needed", probeFailuresBeforeLogin, "detail", res.Detail)
-		m.update(func(s *Snapshot) {
-			s.State = StateConfirming
-			s.Detail = fmt.Sprintf("the connection check failed (%d of %d) — checking again before signing in",
-				m.probeFailures, probeFailuresBeforeLogin)
-		})
-		return
-	}
+	case probe.SessionOffline:
+		// Authoritative: the portal is reachable and says we are not signed in.
+		// No confirmation step — there is nothing ambiguous to confirm.
+		m.attemptLogin(ctx, cfg, sess)
 
-	// Internet is genuinely unreachable. Is this our portal, or somebody else's?
-	// The gate targets the portal root, which answers without a session.
-	reachable, addr, dialErr := probe.PortalReachable(ctx, m.opts.Dial, m.opts.Endpoint.Root)
-	m.update(func(s *Snapshot) { s.PortalAddress = addr })
-
-	if !reachable {
-		detail := "the internet is unreachable, but this is not the campus network"
-		if addr != "" {
-			detail = "the internet is unreachable, but " + addr + " did not answer"
-		}
-		if dialErr != nil {
-			m.log.Debug("portal unreachable", "addr", addr, "err", dialErr)
-		}
+	case probe.SessionUnreachable:
 		m.update(func(s *Snapshot) {
 			s.State = StateNotOnCampus
-			s.Detail = detail
+			s.Detail = "the portal did not answer, so this is not the campus network"
+			if sess.Detail != "" {
+				s.Detail = "the portal did not answer (" + sess.Detail + "), so this is not the campus network"
+			}
 		})
-		return
-	}
 
-	m.attemptLogin(ctx, cfg, addr)
+	default:
+		// Anything we cannot read — an HTTP error, an HTML page, an interception —
+		// must never be treated as "offline". Doing so would let a broken portal
+		// trigger a login on every cycle.
+		m.log.Debug("portal status could not be read", "detail", sess.Detail)
+		m.update(func(s *Snapshot) {
+			s.State = StateUnreadable
+			s.Detail = sess.Detail
+			if s.Detail == "" {
+				s.Detail = "the portal's status reply could not be read"
+			}
+		})
+	}
+}
+
+// session asks the portal about this machine's session, through the injectable
+// endpoint so tests can point at a fake portal.
+func (m *Monitor) session(ctx context.Context) probe.Session {
+	return probe.SessionStatusAt(ctx, m.opts.Client, m.opts.Endpoint.Session)
 }
 
 // attemptLogin performs exactly one credential-bearing request and judges it.
-func (m *Monitor) attemptLogin(ctx context.Context, cfg *config.Config, portalAddr string) {
+func (m *Monitor) attemptLogin(ctx context.Context, cfg *config.Config, sess probe.Session) {
 	now := m.opts.Clock.Now()
 
 	// The hard floor. No path posts twice inside minPostInterval, however the
@@ -383,12 +364,12 @@ func (m *Monitor) attemptLogin(ctx context.Context, cfg *config.Config, portalAd
 
 	m.update(func(s *Snapshot) {
 		s.State = StateLoggingIn
-		s.Detail = "signing in via " + portalAddr
+		s.Detail = "the portal reports no session — signing in"
 		s.NextRetryAt = time.Time{}
 	})
 
 	start := m.opts.Clock.Now()
-	out, err := login.Executef(ctx, m.opts.Client, m.opts.Endpoint.Login, m.opts.Endpoint.Root, cfg.AccountName(), cfg.Password)
+	out, err := login.Executef(ctx, m.opts.Client, m.opts.Endpoint.Login, config.PortalRoot(), cfg.AccountName(), cfg.Password)
 	if err != nil {
 		m.log.Warn("login request failed", "err", err)
 		m.recordAttempt(Attempt{At: start, OK: false, Verdict: "request failed", Summary: err.Error()})
@@ -411,12 +392,13 @@ func (m *Monitor) attemptLogin(ctx context.Context, cfg *config.Config, portalAd
 		return
 	}
 
-	// The re-probe is authoritative: "are we actually online now?" is the only
-	// question that matters, and being online wins over any pattern.
-	ok, vres := m.verifyOnline(ctx, cfg)
+	// The re-check is authoritative: "does the portal now consider us signed
+	// in?" is the only question that matters, and being online wins over any
+	// success pattern.
+	ok, vres := m.verifyOnline(ctx)
 	if ok {
 		m.recordAttempt(Attempt{At: start, OK: true, Verdict: "signed in", Summary: out.Summary()})
-		m.markOnline("signed in successfully")
+		m.markOnline(vres)
 		return
 	}
 
@@ -424,24 +406,24 @@ func (m *Monitor) attemptLogin(ctx context.Context, cfg *config.Config, portalAd
 		m.regexDisagree++
 		if m.regexDisagree >= maxRegexDisagreements {
 			m.recordAttempt(Attempt{At: start, Verdict: "unverified", Summary: out.Summary()})
-			m.failDefinitive("the success pattern matches but the internet is still unreachable — " +
-				"the pattern or the login URL is probably wrong")
+			m.failDefinitive("the portal accepted the request but still reports no session — " +
+				"the login URL is probably wrong")
 			return
 		}
 		m.recordAttempt(Attempt{At: start, Verdict: "unverified", Summary: out.Summary()})
-		m.failTransient("the success pattern matched, but the internet is still unreachable")
+		m.failTransient("the portal accepted the request but still reports no session")
 		return
 	}
 
 	m.recordAttempt(Attempt{At: start, Verdict: "unverified", Summary: out.Summary()})
-	m.failTransient("the login was sent, but the internet is still unreachable (" + vres.Detail + ")")
+	m.failTransient("the login was sent, but the portal still reports no session (" + vres.Detail + ")")
 }
 
-// verifyOnline re-probes the internet, allowing for portals that apply
-// authorisation a moment after answering. It probes immediately, then twice more.
-func (m *Monitor) verifyOnline(ctx context.Context, cfg *config.Config) (bool, probe.Result) {
+// verifyOnline re-asks the portal, allowing for authorisation that is applied a
+// moment after the login answers. It checks immediately, then twice more.
+func (m *Monitor) verifyOnline(ctx context.Context) (bool, probe.Session) {
 	delays := []time.Duration{verifyDelay1, verifyDelay2}
-	var last probe.Result
+	var last probe.Session
 
 	for i := 0; i <= len(delays); i++ {
 		if i > 0 {
@@ -451,23 +433,27 @@ func (m *Monitor) verifyOnline(ctx context.Context, cfg *config.Config) (bool, p
 			case <-m.opts.Clock.After(delays[i-1]):
 			}
 		}
-		last = probe.Internet(ctx, m.opts.Client, cfg.InternetProbe)
-		if last.Kind == probe.Online {
+		last = m.session(ctx)
+		if last.Kind == probe.SessionOnline {
 			return true, last
 		}
 	}
 	return false, last
 }
 
-// markOnline records success and clears every failure counter.
-func (m *Monitor) markOnline(detail string) {
+// markOnline records a portal-confirmed session and clears every failure counter.
+func (m *Monitor) markOnline(sess probe.Session) {
 	wasOnline := m.state() == StateOnline
-	m.probeFailures = 0
 	m.resetBackoff()
 
 	m.update(func(s *Snapshot) {
 		s.State = StateOnline
-		s.Detail = detail
+		s.Detail = "the portal reports an active session"
+		if sess.UID != "" {
+			s.Detail = "signed in as " + sess.UID
+		}
+		s.SessionUID = sess.UID
+		s.SessionSeconds = sess.OnlineSeconds
 		s.NextRetryAt = time.Time{}
 		s.Consecutive = 0
 		if !wasOnline || s.OnlineSince.IsZero() {
@@ -543,10 +529,10 @@ func (m *Monitor) nextWait() time.Duration {
 		}
 		return time.Second
 	default:
-		if p := m.currentConfig().PollInterval(); p > 0 {
-			return p
-		}
-		return config.DefaultPollInterval
+		// The idle poll. This is the only place the configurable interval
+		// applies; the cases above bound how often credentials are sent and must
+		// not be shortened by it.
+		return m.currentConfig().SessionPollInterval()
 	}
 }
 
@@ -574,10 +560,10 @@ func (m *Monitor) notify(title, body string) {
 	m.opts.Notify(title, body)
 }
 
-func (m *Monitor) recordProbe(res probe.Result) {
+func (m *Monitor) recordSession(sess probe.Session) {
 	m.update(func(s *Snapshot) {
-		s.ProbeKind = res.Kind.String()
-		s.ProbeDetail = res.Detail
+		s.SessionKind = sess.Kind.String()
+		s.SessionNote = sess.Detail
 		s.LastCheckAt = m.opts.Clock.Now()
 	})
 }
@@ -658,21 +644,26 @@ func TestOnce(ctx context.Context, client HTTPDoer, dial probe.DialFunc, cfg *co
 		dial = defaultDial
 	}
 
-	res := probe.Internet(ctx, client, cfg.InternetProbe)
-	out := TestResult{ProbeKind: res.Kind.String(), ProbeDetail: res.Detail}
+	sess := probe.SessionStatus(ctx, client)
+	out := TestResult{ProbeKind: sess.Kind.String(), ProbeDetail: sess.Detail}
 
-	if res.Kind == probe.Online {
+	switch sess.Kind {
+	case probe.SessionOnline:
 		out.OK = true
-		out.Message = "Already online — nothing to do. (Gatehouse would not send credentials in this state.)"
+		out.Message = "The portal already reports an active session — nothing to do."
+		if sess.UID != "" {
+			out.Message = "The portal reports an active session for " + sess.UID + " — nothing to do."
+		}
 		return out
-	}
 
-	reachable, addr, dialErr := probe.PortalReachable(ctx, dial, config.PortalRoot())
-	out.PortalAddress = addr
-	if !reachable {
-		out.Message = fmt.Sprintf(
-			"The internet is unreachable, but the portal at %s did not answer, so Gatehouse would do nothing: %v",
-			addr, dialErr)
+	case probe.SessionUnreachable:
+		out.Message = "The portal did not answer, so this is not the campus network. " +
+			"Gatehouse would do nothing here."
+		return out
+
+	case probe.SessionUnreadable:
+		out.Message = "The portal answered, but its status reply could not be read, so Gatehouse " +
+			"would do nothing rather than risk signing in on a bad signal: " + sess.Detail
 		return out
 	}
 
@@ -689,7 +680,7 @@ func TestOnce(ctx context.Context, client HTTPDoer, dial probe.DialFunc, cfg *co
 	out.HTTPStatus = lout.StatusCode
 	out.ResponseHead = headOf(lout.Body)
 
-	// Settle briefly, then let the probe decide.
+	// Settle briefly, then let the portal decide.
 	select {
 	case <-ctx.Done():
 		out.Message = "Cancelled."
@@ -697,7 +688,7 @@ func TestOnce(ctx context.Context, client HTTPDoer, dial probe.DialFunc, cfg *co
 	case <-time.After(verifyDelay1):
 	}
 
-	if after := probe.Internet(ctx, client, cfg.InternetProbe); after.Kind == probe.Online {
+	if after := probe.SessionStatus(ctx, client); after.Kind == probe.SessionOnline {
 		out.OK = true
 		out.Message = "Signed in successfully."
 		return out
@@ -707,10 +698,10 @@ func TestOnce(ctx context.Context, client HTTPDoer, dial probe.DialFunc, cfg *co
 	case login.VerdictRejected:
 		out.Message = "The portal rejected these credentials (" + lout.Summary() + ")."
 	case login.VerdictAccepted:
-		out.Message = "The success pattern matched, but the internet is still unreachable — " +
-			"the pattern or the login URL is probably wrong (" + lout.Summary() + ")."
+		out.Message = "The portal accepted the request but still reports no session — " +
+			"the login URL is probably wrong (" + lout.Summary() + ")."
 	default:
-		out.Message = "The login was sent, but the internet is still unreachable (" + lout.Summary() + ")."
+		out.Message = "The login was sent, but the portal still reports no session (" + lout.Summary() + ")."
 	}
 	return out
 }

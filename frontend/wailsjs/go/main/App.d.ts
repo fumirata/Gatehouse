@@ -16,8 +16,6 @@ export function GetState():Promise<monitor.Snapshot>;
 
 export function HideWindow():Promise<void>;
 
-export function ListProbePresets():Promise<Array<main.ProbePreset>>;
-
 export function Quit():Promise<void>;
 
 export function ReconnectNow():Promise<void>;

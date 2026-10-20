@@ -1,7 +1,7 @@
 import './style.css';
 import {
   GetState, GetConfig, SaveConfig, TestLogin,
-  ReconnectNow, CheckNow, GetLog, ListProbePresets,
+  ReconnectNow, CheckNow, GetLog,
   HideWindow, Quit,
 } from '../wailsjs/go/main/App';
 import {EventsOn} from '../wailsjs/runtime/runtime';
@@ -60,25 +60,23 @@ const TEMPLATE = `
 </section>
 
 <section>
-  <h2>Connectivity check</h2>
+  <h2>Portal session</h2>
   <p class="hint">
-    Gatehouse only signs in when this check fails <em>and</em> the login host answers, so a
-    hotel or airport portal never sees your campus password.
+    Gatehouse asks the portal whether you are signed in, rather than guessing from
+    whether the internet works. Off campus the portal does not answer, so nothing
+    is sent.
   </p>
-  <div class="presets" id="presets"></div>
-  <label>Check URL <input id="probe-url" type="text" spellcheck="false"></label>
-  <div class="grid">
-    <label>Expected status <input id="probe-status" type="number" min="100" max="599"></label>
-    <label>Expected text
-      <input id="probe-body" type="text" spellcheck="false"
-        placeholder="(none — 204 endpoints return no body)">
-    </label>
-  </div>
-  <p class="hint">Leave "Expected text" empty for a 204-style endpoint that returns no body.</p>
+  <div class="session-line" id="session-line"></div>
 
   <details>
     <summary>Advanced</summary>
-    <label>Check every (seconds) <input id="poll" type="number" min="5" max="3600"></label>
+    <label>Check the portal every (seconds)
+      <input id="poll" type="number" min="1" max="60" step="1">
+    </label>
+    <p class="hint">
+      Between 1 and 60. A shorter interval notices an expired session sooner;
+      it does not change how often Gatehouse retries a failed sign-in.
+    </p>
     <label class="checkline">
       <input id="autostart" type="checkbox"> Start Gatehouse when I sign in
     </label>
@@ -133,26 +131,24 @@ const $ = (id) => document.getElementById(id);
 
 const STATE_CLASS = {
   online: 'ok',
-  confirming: 'idle',
   logging_in: 'busy',
   login_failed: 'warn',
   auth_rejected: 'bad',
   suspended: 'bad',
   not_on_campus: 'idle',
-  misconfigured: 'warn',
+  unreadable: 'warn',
   needs_config: 'warn',
   unknown: 'idle',
 };
 
 const STATE_LABEL = {
   online: 'Online',
-  confirming: 'Checking again…',
   logging_in: 'Signing in…',
   login_failed: 'Sign-in failed — retrying',
   auth_rejected: 'Credentials rejected',
   suspended: 'Paused after repeated failures',
   not_on_campus: 'Not on the campus network',
-  misconfigured: 'Check the connectivity settings',
+  unreadable: "Could not read the portal's status",
   needs_config: 'Not configured yet',
   unknown: 'Starting up…',
 };
@@ -181,12 +177,7 @@ function fillForm(cfg) {
   carrier.value = cfg.carrier || DEFAULT_CARRIER;
   if (!carrier.value) carrier.selectedIndex = 0;
 
-  const probe = cfg.internet_probe || {};
-  $('probe-url').value = probe.url || '';
-  $('probe-status').value = probe.expect_status || 200;
-  $('probe-body').value = probe.expect_body ?? '';
-
-  $('poll').value = cfg.poll_interval_seconds || 15;
+  $('poll').value = cfg.session_poll_interval_seconds || 5;
   $('autostart').checked = !!cfg.autostart;
 
   renderRequestPreview();
@@ -197,12 +188,7 @@ function readForm() {
     username: $('username').value,
     password: $('password').value,
     carrier: $('carrier').value,
-    internet_probe: {
-      url: $('probe-url').value.trim(),
-      expect_status: Number($('probe-status').value) || 200,
-      expect_body: $('probe-body').value,
-    },
-    poll_interval_seconds: Number($('poll').value) || 15,
+    session_poll_interval_seconds: Number($('poll').value) || 5,
     autostart: $('autostart').checked,
   };
 }
@@ -251,7 +237,39 @@ function renderState(s) {
   if (s.last_check_at) bits.push('checked ' + new Date(s.last_check_at).toLocaleTimeString());
   $('state-detail').textContent = bits.join(' · ');
 
+  renderSession(s);
   renderHistory(s.history || []);
+}
+
+// What the portal itself reports, shown separately from our own state so the two
+// can be compared when something looks wrong.
+function renderSession(s) {
+  const el = $('session-line');
+  if (!el) return;
+
+  const kind = s.session_kind || '';
+  const parts = [];
+
+  if (kind === 'online') {
+    parts.push(s.session_uid ? `signed in as ${s.session_uid}` : 'signed in');
+    if (s.session_seconds) {
+      const h = Math.floor(s.session_seconds / 3600);
+      const m = Math.floor((s.session_seconds % 3600) / 60);
+      parts.push(h ? `up ${h}h ${m}m` : `up ${m}m`);
+    }
+  } else if (kind === 'offline') {
+    parts.push('the portal reports no session');
+  } else if (kind === 'unreachable') {
+    parts.push('the portal did not answer');
+  } else if (kind === 'unreadable') {
+    parts.push("the portal's reply could not be read");
+  } else {
+    parts.push('not checked yet');
+  }
+
+  if (s.session_note) parts.push(s.session_note);
+  el.textContent = parts.join(' · ');
+  el.className = `session-line ${kind}`;
 }
 
 function renderHistory(items) {
@@ -280,25 +298,6 @@ async function refreshLog() {
   }
 }
 
-async function loadPresets() {
-  try {
-    const presets = await ListProbePresets();
-    $('presets').innerHTML = presets.map((p, i) =>
-      `<button type="button" class="ghost small" data-preset="${i}" title="${p.note}">${p.name}</button>`
-    ).join('');
-    $('presets').querySelectorAll('button').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const p = presets[Number(btn.dataset.preset)];
-        $('probe-url').value = p.url;
-        $('probe-status').value = p.status;
-        $('probe-body').value = p.body;
-        banner('', '');
-      });
-    });
-  } catch (err) {
-    console.error(err);
-  }
-}
 
 // ------------------------------------------------------------------ actions
 
@@ -336,7 +335,7 @@ async function doTest() {
   try {
     const res = await TestLogin(readForm());
     const parts = [res.message];
-    if (res.probe_detail) parts.push(`Check: ${res.probe_detail}.`);
+    if (res.probe_detail) parts.push(`Portal: ${res.probe_detail}.`);
     if (res.portal_address) parts.push(`Login host: ${res.portal_address}.`);
     banner(res.ok ? 'good' : 'bad', parts.filter(Boolean).join(' '));
   } catch (err) {
@@ -392,7 +391,6 @@ async function init() {
     banner('bad', 'Could not read the settings: ' + err);
   }
 
-  await loadPresets();
   await refreshState();
   refreshLog();
 }

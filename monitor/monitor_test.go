@@ -25,11 +25,12 @@ type fakePortal struct {
 	srv *httptest.Server
 
 	mu          sync.Mutex
-	intercepted bool     // probe is answered by a portal instead of the internet
+	offline     bool     // the portal reports no session
+	unreadable  bool     // the portal answers with something we cannot parse
 	logins      []string // query strings received at the Dr.COM login endpoint
-	reject      bool     // portal answers "wrong password"
+	reject      bool     // the portal answers "wrong password"
 	rejectBody  string
-	stayOffline bool // accepts the login but never opens up
+	stayOffline bool // accepts the login but still reports no session
 }
 
 // drcomSuccess and drcomReject are the JSONP replies a real Dr.COM portal sends.
@@ -42,19 +43,25 @@ const (
 func newFakePortal(t *testing.T) *fakePortal {
 	t.Helper()
 
-	f := &fakePortal{intercepted: true, rejectBody: drcomReject}
+	f := &fakePortal{offline: true, rejectBody: drcomReject}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/check", func(w http.ResponseWriter, r *http.Request) {
+	// The portal's own status endpoint: the single signal the monitor acts on.
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 
-		if f.intercepted {
-			// A redirect is how a captive portal announces itself.
-			http.Redirect(w, r, "http://10.0.0.1/portal", http.StatusFound)
+		if f.unreadable {
+			// A portal that answers, but not in a way we understand.
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, "<html><body>Error code: 400 URL no found</body></html>")
 			return
 		}
-		io.WriteString(w, config.DefaultInternetExpectBody)
+		if f.offline {
+			io.WriteString(w, `dr1002({"result":0})`)
+			return
+		}
+		io.WriteString(w, `dr1002({"result":1,"uid":"alice@cmcc","oltime":3600})`)
 	})
 	// The Dr.COM login endpoint: a GET whose query carries the credentials.
 	mux.HandleFunc(config.LoginPath, func(w http.ResponseWriter, r *http.Request) {
@@ -67,12 +74,12 @@ func newFakePortal(t *testing.T) *fakePortal {
 			return
 		}
 		if f.stayOffline {
-			// Accepts the request but never opens the network, and says nothing
-			// conclusive — the case where only the re-probe can decide.
+			// Accepts the request but the portal still reports no session — the
+			// case where only the re-check can decide.
 			io.WriteString(w, drcomInconclusive)
 			return
 		}
-		f.intercepted = false
+		f.offline = false
 		io.WriteString(w, drcomSuccess)
 	})
 
@@ -96,10 +103,16 @@ func (f *fakePortal) lastLogin() string {
 	return f.logins[len(f.logins)-1]
 }
 
-func (f *fakePortal) setIntercepted(v bool) {
+func (f *fakePortal) setOffline(v bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.intercepted = v
+	f.offline = v
+}
+
+func (f *fakePortal) setUnreadable(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unreadable = v
 }
 
 func (f *fakePortal) setReject(v bool) {
@@ -134,14 +147,9 @@ func newHarness(t *testing.T, dial probe.DialFunc, tweak func(*config.Config)) *
 	clock := NewFakeClock(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
 
 	cfg := &config.Config{
-		Username: "alice",
-		Password: "correct horse",
-		InternetProbe: config.InternetProbe{
-			URL:          f.srv.URL + "/check",
-			ExpectStatus: http.StatusOK,
-			ExpectBody:   config.DefaultInternetExpectBody,
-		},
-		PollIntervalSeconds: 15,
+		Username:                   "alice",
+		Password:                   "correct horse",
+		SessionPollIntervalSeconds: 5,
 	}
 	if tweak != nil {
 		tweak(cfg)
@@ -158,7 +166,10 @@ func newHarness(t *testing.T, dial probe.DialFunc, tweak func(*config.Config)) *
 		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Notify: func(title, body string) { h.notes = append(h.notes, title+": "+body) },
 		// Point at the fake portal instead of the fixed campus address.
-		Endpoint: &Endpoint{Root: root, Login: root + strings.TrimPrefix(config.LoginPath, "/")},
+		Endpoint: &Endpoint{
+			Session: root + "status",
+			Login:   root + strings.TrimPrefix(config.LoginPath, "/"),
+		},
 	})
 	return h
 }
@@ -216,16 +227,6 @@ func (h *harness) stepAfter(d time.Duration) {
 	h.step()
 }
 
-// stepUntilAttempt runs the cycles needed to reach a credential-bearing attempt.
-// The first failed probe only starts confirmation, so a test expecting a login
-// has to pass that gate first.
-func (h *harness) stepUntilAttempt() {
-	h.t.Helper()
-	for i := 0; i < probeFailuresBeforeLogin; i++ {
-		h.step()
-	}
-}
-
 func (h *harness) state() State { return h.m.Snapshot().State }
 
 // ----------------------------------------------------------- the two promises
@@ -233,7 +234,7 @@ func (h *harness) state() State { return h.m.Snapshot().State }
 // The whole point of the trigger rule: while the internet works, nothing is sent.
 func TestNothingIsSentWhenOnline(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, nil)
-	h.f.setIntercepted(false)
+	h.f.setOffline(false)
 
 	for i := 0; i < 5; i++ {
 		h.step()
@@ -247,11 +248,11 @@ func TestNothingIsSentWhenOnline(t *testing.T) {
 	}
 }
 
-// The security property: no internet, but this is not our campus network, so the
-// credentials must stay put.
+// The security property: the portal does not answer, so this is not the campus
+// network and the credentials must stay put.
 func TestNothingIsSentWhenThePortalIsNotReachable(t *testing.T) {
 	h := newHarness(t, dialNever, nil)
-	h.f.setIntercepted(true)
+	h.m.opts.Endpoint.Session = "http://127.0.0.1:1/status"
 
 	for i := 0; i < 3; i++ {
 		h.step()
@@ -267,9 +268,9 @@ func TestNothingIsSentWhenThePortalIsNotReachable(t *testing.T) {
 
 func TestSignsInWhenThePortalIsPresent(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, nil)
-	h.f.setIntercepted(true)
+	h.f.setOffline(true)
 
-	h.stepUntilAttempt()
+	h.step()
 
 	if got := h.state(); got != StateOnline {
 		t.Errorf("state = %q, want %q (detail: %s)", got, StateOnline, h.m.Snapshot().Detail)
@@ -305,8 +306,8 @@ func TestPasswordWithMetacharactersSurvivesTheRoundTrip(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, func(c *config.Config) {
 		c.Password = password
 	})
-	h.f.setIntercepted(true)
-	h.stepUntilAttempt()
+	h.f.setOffline(true)
+	h.step()
 
 	if n := h.f.loginCount(); n != 1 {
 		t.Fatalf("sent %d login requests, want 1", n)
@@ -321,63 +322,56 @@ func TestPasswordWithMetacharactersSurvivesTheRoundTrip(t *testing.T) {
 	}
 }
 
-// ------------------------------------------------------- confirming an outage
+// ------------------------------------------------------------ the portal says
 
-// One failed check is a blip, not an outage. Acting on it would send the
-// password over plain HTTP for nothing.
-func TestOneFailedCheckDoesNotSendCredentials(t *testing.T) {
+// The portal's verdict is authoritative, so a reported "no session" is acted on
+// immediately — no confirmation cycle, which is the whole point of asking the
+// portal instead of inferring from a failed internet check.
+func TestPortalReportingNoSessionLogsInImmediately(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, nil)
-	h.f.setIntercepted(true)
+	h.f.setOffline(true)
 
 	h.step()
 
-	if got := h.state(); got != StateConfirming {
-		t.Errorf("state = %q, want %q", got, StateConfirming)
-	}
-	if n := h.f.loginCount(); n != 0 {
-		t.Errorf("sent %d login requests after a single failed check, want 0", n)
-	}
-}
-
-func TestTwoConsecutiveFailuresSendCredentials(t *testing.T) {
-	h := newHarness(t, dialAlwaysOK, nil)
-	h.f.setIntercepted(true)
-
-	h.step()
-	if n := h.f.loginCount(); n != 0 {
-		t.Fatalf("first check sent %d requests, want 0", n)
-	}
-
-	h.step()
 	if n := h.f.loginCount(); n != 1 {
-		t.Errorf("second consecutive failure sent %d requests, want 1", n)
+		t.Errorf("sent %d login requests on the first cycle, want 1", n)
+	}
+	if got := h.state(); got != StateOnline {
+		t.Errorf("state = %q, want %q", got, StateOnline)
 	}
 }
 
-// A healthy check between two failures means they were not consecutive, so the
-// count starts over rather than accumulating across an intermittent connection.
-func TestASuccessfulCheckResetsTheConfirmation(t *testing.T) {
+// A portal that answers with something we cannot read must never be taken as
+// "you are offline". A broken portal would otherwise cause a login every cycle.
+func TestUnreadablePortalStatusNeverLogsIn(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, nil)
+	h.f.setUnreadable(true)
 
-	h.f.setIntercepted(true)
-	h.step() // failure 1
-	if got := h.state(); got != StateConfirming {
-		t.Fatalf("state = %q, want %q", got, StateConfirming)
+	for i := 0; i < 5; i++ {
+		h.step()
 	}
 
-	h.f.setIntercepted(false)
-	h.step() // healthy — this must clear the count
-	if got := h.state(); got != StateOnline {
-		t.Fatalf("state = %q, want %q", got, StateOnline)
-	}
-
-	h.f.setIntercepted(true)
-	h.step() // failure 1 again, not failure 2
 	if n := h.f.loginCount(); n != 0 {
-		t.Errorf("sent %d login requests: the healthy check did not reset the count", n)
+		t.Errorf("sent %d login requests on an unreadable status, want 0", n)
 	}
-	if got := h.state(); got != StateConfirming {
-		t.Errorf("state = %q, want %q", got, StateConfirming)
+	if got := h.state(); got != StateUnreadable {
+		t.Errorf("state = %q, want %q", got, StateUnreadable)
+	}
+}
+
+func TestPortalOnlineSendsNothing(t *testing.T) {
+	h := newHarness(t, dialAlwaysOK, nil)
+	h.f.setOffline(false)
+
+	for i := 0; i < 5; i++ {
+		h.step()
+	}
+
+	if n := h.f.loginCount(); n != 0 {
+		t.Errorf("sent %d login requests while the portal reports a session, want 0", n)
+	}
+	if got := h.state(); got != StateOnline {
+		t.Errorf("state = %q, want %q", got, StateOnline)
 	}
 }
 
@@ -385,12 +379,10 @@ func TestASuccessfulCheckResetsTheConfirmation(t *testing.T) {
 
 func TestTransientFailuresBackOffExponentially(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, nil)
-	h.f.setIntercepted(true)
+	h.f.setOffline(true)
 	h.f.stayOffline = true // the portal never actually opens up
 
-	// The first cycle only confirms; the second reaches the first attempt and
-	// schedules the base delay.
-	h.stepUntilAttempt()
+	h.step()
 	waits := []time.Duration{h.m.nextWait()}
 
 	for i := 1; i < 8; i++ {
@@ -412,10 +404,10 @@ func TestTransientFailuresBackOffExponentially(t *testing.T) {
 
 func TestNoTwoRequestsInsideTheMinimumInterval(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, nil)
-	h.f.setIntercepted(true)
+	h.f.setOffline(true)
 	h.f.stayOffline = true
 
-	h.stepUntilAttempt()
+	h.step()
 	if n := h.f.loginCount(); n != 1 {
 		t.Fatalf("first attempt cycle sent %d requests, want 1", n)
 	}
@@ -445,10 +437,10 @@ func TestNoTwoRequestsInsideTheMinimumInterval(t *testing.T) {
 
 func TestRejectedCredentialsBackOffHardAndTellTheUser(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, nil)
-	h.f.setIntercepted(true)
+	h.f.setOffline(true)
 	h.f.setReject(true)
 
-	h.stepUntilAttempt()
+	h.step()
 
 	if got := h.state(); got != StateAuthRejected {
 		t.Fatalf("state = %q, want %q (detail: %s)", got, StateAuthRejected, h.m.Snapshot().Detail)
@@ -465,10 +457,10 @@ func TestRejectedCredentialsBackOffHardAndTellTheUser(t *testing.T) {
 // the credentials may well be fine and the portal is simply not ready.
 func TestLoginThatDoesNotOpenTheNetworkIsTransient(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, nil)
-	h.f.setIntercepted(true)
+	h.f.setOffline(true)
 	h.f.stayOffline = true
 
-	h.stepUntilAttempt()
+	h.step()
 
 	if got := h.state(); got != StateLoginFailed {
 		t.Errorf("state = %q, want %q", got, StateLoginFailed)
@@ -477,11 +469,11 @@ func TestLoginThatDoesNotOpenTheNetworkIsTransient(t *testing.T) {
 
 func TestRepeatedRejectionsPauseTheApp(t *testing.T) {
 	h := newHarness(t, dialAlwaysOK, nil)
-	h.f.setIntercepted(true)
+	h.f.setOffline(true)
 	h.f.setReject(true)
 
 	// The first cycle confirms the outage; the next one is the first rejection.
-	h.stepUntilAttempt()
+	h.step()
 	for i := 1; i < maxDefinitiveStreak; i++ {
 		h.stepAfter(definitiveBackoff)
 	}
@@ -516,29 +508,20 @@ func TestUnconfiguredAppDoesNotProbeOrSignIn(t *testing.T) {
 	}
 }
 
-// A probe URL that answers with neither the expected payload nor anything
-// portal-shaped means the settings are wrong, not that the network is down.
-func TestMisconfiguredProbeIsReportedRatherThanActedOn(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/check" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		io.WriteString(w, "ok")
-	}))
-	defer srv.Close()
-
-	h := newHarness(t, dialAlwaysOK, func(c *config.Config) {
-		c.InternetProbe.URL = srv.URL + "/check"
-	})
+// The portal not answering at all means this is not the campus network, so
+// nothing is sent — the same protection the old internet probe provided, now
+// resting on the portal being unreachable.
+func TestUnreachablePortalSendsNothing(t *testing.T) {
+	h := newHarness(t, dialAlwaysOK, nil)
+	h.m.opts.Endpoint.Session = "http://127.0.0.1:1/status"
 
 	h.step()
 
-	if got := h.state(); got != StateMisconfigured {
-		t.Fatalf("state = %q, want %q (detail: %s)", got, StateMisconfigured, h.m.Snapshot().Detail)
+	if got := h.state(); got != StateNotOnCampus {
+		t.Errorf("state = %q, want %q", got, StateNotOnCampus)
 	}
 	if n := h.f.loginCount(); n != 0 {
-		t.Errorf("sent %d requests while the probe was misconfigured, want 0", n)
+		t.Errorf("sent %d login requests with no portal, want 0", n)
 	}
 }
 
@@ -554,20 +537,25 @@ func TestCredentialsAreNotResentAcrossARedirect(t *testing.T) {
 
 	// The login endpoint redirects the credential-bearing request elsewhere.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/check", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, foreign.URL+"/evil", http.StatusFound)
+	// The portal reports no session, so a login is attempted...
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `dr1002({"result":0})`)
 	})
+	// ...and the login endpoint redirects the credential-bearing request away.
 	mux.HandleFunc(config.LoginPath, func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, foreign.URL+"/evil", http.StatusTemporaryRedirect)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	h := newHarness(t, dialAlwaysOK, func(c *config.Config) {
-		c.InternetProbe.URL = srv.URL + "/check"
-	})
+	h := newHarness(t, dialAlwaysOK, nil)
+	root := strings.TrimSuffix(srv.URL, "/") + "/"
+	h.m.opts.Endpoint = &Endpoint{
+		Session: root + "status",
+		Login:   root + strings.TrimPrefix(config.LoginPath, "/"),
+	}
 
-	h.stepUntilAttempt()
+	h.step()
 
 	if foreignHits != 0 {
 		t.Errorf("the credential-bearing request was followed to another host %d times, want 0", foreignHits)
@@ -591,4 +579,57 @@ func parseForm(t *testing.T, body string) url.Values {
 		t.Fatalf("could not parse the form body %q: %v", body, err)
 	}
 	return values
+}
+
+// ---------------------------------------------------------------- poll timing
+
+// The poll interval controls how quickly an expired session is noticed. It must
+// not shorten anything that bounds how often credentials are sent — that is what
+// keeps a mis-set value from hammering the portal.
+func TestPollIntervalDoesNotShortenLoginBackoff(t *testing.T) {
+	h := newHarness(t, dialAlwaysOK, func(c *config.Config) {
+		c.SessionPollIntervalSeconds = 1 // the most aggressive poll allowed
+	})
+	h.f.setOffline(true)
+	h.f.stayOffline = true // the portal accepts the login but reports no session
+
+	h.step()
+
+	if got := h.m.nextWait(); got == time.Second {
+		t.Fatalf("next wait = %v: the poll interval leaked into login backoff", got)
+	}
+	if got := h.m.nextWait(); got < baseBackoff {
+		t.Errorf("next wait = %v, want at least the %v base backoff", got, baseBackoff)
+	}
+
+	// And the hard floor between credential-bearing requests still holds.
+	if h.m.lastPostAt.IsZero() {
+		t.Error("no attempt was recorded, so the floor was not exercised")
+	}
+	if minPostInterval <= time.Second {
+		t.Errorf("minPostInterval = %v, want it independent of the poll interval", minPostInterval)
+	}
+}
+
+// A shorter poll interval shortens the idle wait, which is the point.
+func TestShorterPollIntervalShortensTheIdleWait(t *testing.T) {
+	for _, tc := range []struct {
+		seconds int
+		want    time.Duration
+	}{
+		{1, time.Second},
+		{5, 5 * time.Second},
+		{30, 30 * time.Second},
+	} {
+		h := newHarness(t, dialAlwaysOK, func(c *config.Config) {
+			c.SessionPollIntervalSeconds = tc.seconds
+		})
+		h.f.setOffline(false) // online: the idle path
+
+		h.step()
+
+		if got := h.m.nextWait(); got != tc.want {
+			t.Errorf("with a %ds interval, next wait = %v, want %v", tc.seconds, got, tc.want)
+		}
+	}
 }

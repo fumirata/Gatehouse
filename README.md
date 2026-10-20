@@ -7,20 +7,29 @@ is actually there, replays your login request, and gets out of the way.
 ## The rule it follows
 
 ```
-every check:
-  is the internet reachable?  ── yes ──►  online, do nothing
-           │ no
-           ▼
-  does the portal host answer? ── no ──►  not on campus, do nothing
-           │ yes
-           ▼
-        sign in, then re-check
+every check (every few seconds, a ~50ms LAN call):
+  ask the portal: is this machine signed in?
+    ├─ yes                 ──►  online, do nothing
+    ├─ no                  ──►  sign in now, then re-check
+    ├─ does not answer     ──►  not on campus, do nothing
+    └─ unreadable reply    ──►  do nothing, and say so
 ```
 
-The second question is the important one. Because credentials are only sent when
-the **configured** portal host answers, a hotel, airport, or cafe portal never
-sees your campus password. Nothing is keyed off the Wi-Fi SSID, so Ethernet works
-exactly the same way.
+Gatehouse asks the portal's own status endpoint rather than probing the
+internet. That is both faster — a LAN round trip instead of an internet one — and
+unambiguous: the portal knows whether it has a session for this client, whereas a
+failed internet check only implies that *something* is wrong. Because the answer
+is authoritative, an expired session is acted on immediately rather than after a
+confirmation delay.
+
+Off campus the portal simply does not answer, so nothing is sent and a hotel,
+airport, or cafe portal never sees your campus password. Nothing is keyed off the
+Wi-Fi SSID, so Ethernet works exactly the same way.
+
+The one reply that must never be misread is an *unreadable* one — an HTTP error,
+an HTML page, an interception. Anything that is not a clean, parsed "you are not
+signed in" is treated as "do nothing", so a broken portal cannot trigger a login
+on every cycle.
 
 ## Install
 
@@ -76,12 +85,17 @@ it anywhere except the configured portal.
 
 | Situation | What happens |
 |---|---|
-| Internet works | Nothing. No request is sent. |
-| Offline, portal not reachable | Nothing, and the tray icon turns grey. |
-| Offline, portal reachable | One login request, then a re-check. |
+| Portal reports a session | Nothing. No request is sent. |
+| Portal reports no session | One login request, then a re-check. Typically a few seconds after the session expires. |
+| Portal does not answer | Nothing, and the tray icon turns grey — this is not the campus network. |
+| Portal's reply is unreadable | Nothing, and the status says so. A broken portal is never taken as "sign in". |
 | Login failed | Retries at 5s, 10s, 20s … capped at 5 minutes. |
 | Portal rejected the password | Backs off 5 minutes and notifies once. |
 | Rejected 3× in a row | Pauses for 30 minutes and tells you. |
+
+How often the portal is asked is configurable (1–60s, default 5s). It affects
+only how quickly an expired session is noticed; it does not change how often a
+failed sign-in is retried.
 
 Closing the window hides it to the tray; **Quit Gatehouse** in the tray menu
 exits. Launching it again while it is running just brings the window forward.
@@ -93,7 +107,7 @@ main.go        wiring: tray first (on the main thread), then Wails
 app.go         the object exposed to the settings window
 tray.go        notification-area icon and menu
 config/        settings file, defaults, validation
-probe/         "is the internet up?" and "is the portal there?"
+probe/         asks the portal whether this machine is signed in
 login/         the Dr.COM request, credential escaping, response verdicts
 monitor/       the state machine: when to act, backoff, suspension
 autostart/     the HKCU Run entry

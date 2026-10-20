@@ -26,10 +26,6 @@ export function HideWindow() {
   return window['go']['main']['App']['HideWindow']();
 }
 
-export function ListProbePresets() {
-  return window['go']['main']['App']['ListProbePresets']();
-}
-
 export function Quit() {
   return window['go']['main']['App']['Quit']();
 }

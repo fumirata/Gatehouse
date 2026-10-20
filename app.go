@@ -309,49 +309,6 @@ func (a *App) ShowWindow() { a.tray.showWindow() }
 // Quit exits Gatehouse.
 func (a *App) Quit() { a.quitFromTray() }
 
-// ProbePreset is a known-good connectivity-check endpoint offered in the UI.
-type ProbePreset struct {
-	Name   string `json:"name"`
-	URL    string `json:"url"`
-	Status int    `json:"status"`
-	Body   string `json:"body"`
-	Note   string `json:"note"`
-}
-
-// ListProbePresets returns connectivity-check endpoints to choose from.
-//
-// Having alternatives matters: campus networks do block some of these, and a
-// blocked probe URL looks exactly like a permanent outage.
-func (a *App) ListProbePresets() []ProbePreset {
-	return []ProbePreset{
-		{
-			Name: "Microsoft NCSI", URL: config.DefaultInternetProbeURL,
-			Status: 200, Body: config.DefaultInternetExpectBody,
-			Note: "The default. Reachable from most networks, including mainland China.",
-		},
-		{
-			Name: "Xiaomi", URL: "http://connect.rom.miui.com/generate_204",
-			Status: 204, Body: "",
-			Note: "Small and fast. Good fallback for mainland China.",
-		},
-		{
-			Name: "Huawei", URL: "http://connectivitycheck.platform.hicloud.com/generate_204",
-			Status: 204, Body: "",
-			Note: "Good fallback for mainland China.",
-		},
-		{
-			Name: "Apple", URL: "http://captive.apple.com/hotspot-detect.html",
-			Status: 200, Body: "Success",
-			Note: "What iOS uses to detect captive portals.",
-		},
-		{
-			Name: "Google", URL: "http://connectivitycheck.gstatic.com/generate_204",
-			Status: 204, Body: "",
-			Note: "Blocked on mainland China networks — it will look like a permanent outage there.",
-		},
-	}
-}
-
 // quitFromTray exits the application cleanly.
 //
 // Order matters and is not arbitrary:
